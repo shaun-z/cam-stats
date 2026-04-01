@@ -1,0 +1,35 @@
+[project]
+name = "xstream"
+version = "0.1.0"
+description = "GradCAM benchmarking for X-Stream (Figure 12 reproduction)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+]
+
+[project.optional-dependencies]
+cuda = ["pynvml>=11.0"]
+tpu = ["torch-xla>=2.0"]
+
+[project.scripts]
+xstream-bench = "xstream.benchmark.runner:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[tool.uv]
+constraint-dependencies = ["torch<2.11", "torchvision<0.26"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xstream"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
