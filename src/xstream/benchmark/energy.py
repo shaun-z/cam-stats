@@ -6,6 +6,7 @@ import glob
 import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -106,49 +107,93 @@ def _is_jetson() -> bool:
     return False
 
 
-def _find_jetson_power_rail() -> Path | None:
+@dataclass
+class _JetsonRail:
+    """Describes a Jetson power rail: either a direct power file or V×I pair."""
+
+    power_path: Path | None = None
+    voltage_path: Path | None = None
+    current_path: Path | None = None
+
+    @property
+    def is_vi(self) -> bool:
+        return self.voltage_path is not None and self.current_path is not None
+
+    def read_power_w(self) -> float:
+        """Read instantaneous power in watts."""
+        if self.power_path is not None:
+            # power*_input is in µW
+            return int(self.power_path.read_text().strip()) / 1_000_000.0
+        assert self.voltage_path is not None and self.current_path is not None
+        # in*_input is in mV, curr*_input is in mA → mV * mA = µW
+        voltage_mv = int(self.voltage_path.read_text().strip())
+        current_ma = int(self.current_path.read_text().strip())
+        return (voltage_mv * current_ma) / 1_000_000.0
+
+
+def _find_jetson_power_rail() -> _JetsonRail | None:
     """
     Scan /sys/class/hwmon/ for INA3221 power rail sysfs entries.
 
-    Returns the path to the best power*_input file (microwatts), or None.
+    Returns a ``_JetsonRail`` for the best-matching rail, or None.
 
-    Jetson Orin exposes power via hwmon devices backed by ina3221x.
-    Each channel has:
-      - power<N>_input   (µW, instantaneous)
-      - power<N>_label   (rail name, e.g. "VDD_GPU_SOC")
+    Supports two sysfs layouts:
+      1. power<N>_input (µW) — newer Jetson kernels
+      2. in<N>_input (mV) + curr<N>_input (mA) — e.g. Orin NX with ina3221
     """
     hwmon_dirs = sorted(glob.glob("/sys/class/hwmon/hwmon*"))
 
-    # Collect all (priority, power_input_path) pairs
-    candidates: list[tuple[int, Path]] = []
+    # Collect all (priority, _JetsonRail) pairs
+    candidates: list[tuple[int, _JetsonRail]] = []
 
     for hwmon in hwmon_dirs:
         hwmon_path = Path(hwmon)
-        # Check each power channel
+
+        # --- Strategy 1: power*_label / power*_input (µW) ---
         for label_file in sorted(hwmon_path.glob("power*_label")):
             try:
                 rail_name = label_file.read_text().strip()
             except OSError:
                 continue
-            # Derive the corresponding power*_input file
             input_file = label_file.with_name(
                 label_file.name.replace("_label", "_input")
             )
             if not input_file.exists():
                 continue
-
-            # Assign priority (lower = better)
             try:
                 prio = _JETSON_RAIL_PRIORITY.index(rail_name)
             except ValueError:
-                prio = len(_JETSON_RAIL_PRIORITY)  # unknown rail, lowest prio
-            candidates.append((prio, input_file))
+                prio = len(_JETSON_RAIL_PRIORITY)
+            candidates.append((prio, _JetsonRail(power_path=input_file)))
+
+        # --- Strategy 2: in<N>_label + in<N>_input (mV) + curr<N>_input (mA) ---
+        for label_file in sorted(hwmon_path.glob("in*_label")):
+            try:
+                rail_name = label_file.read_text().strip()
+            except OSError:
+                continue
+            # Extract channel number: in<N>_label → N
+            stem = label_file.stem  # e.g. "in2_label"
+            chan = stem.split("_")[0]  # e.g. "in2"
+            chan_num = chan[2:]  # e.g. "2"
+
+            voltage_file = label_file.with_name(f"{chan}_input")
+            current_file = label_file.with_name(f"curr{chan_num}_input")
+            if not voltage_file.exists() or not current_file.exists():
+                continue
+            try:
+                prio = _JETSON_RAIL_PRIORITY.index(rail_name)
+            except ValueError:
+                prio = len(_JETSON_RAIL_PRIORITY)
+            candidates.append(
+                (prio, _JetsonRail(voltage_path=voltage_file, current_path=current_file))
+            )
 
     if not candidates:
         # Fallback: any power*_input file (no label)
         for hwmon in hwmon_dirs:
             for p in sorted(Path(hwmon).glob("power*_input")):
-                return p
+                return _JetsonRail(power_path=p)
         return None
 
     candidates.sort(key=lambda x: x[0])
@@ -159,17 +204,25 @@ class JetsonEnergyMonitor(EnergyMonitor):
     """
     Samples Jetson module/GPU power via sysfs INA3221 sensors.
 
-    Reads power*_input (microwatts) in a background thread and integrates
-    via the trapezoidal rule — same methodology as NvidiaEnergyMonitor.
+    Supports two sysfs layouts:
+      - power*_input (µW) — direct power reading
+      - in*_input (mV) + curr*_input (mA) — voltage × current
+
+    Uses a background thread and trapezoidal integration.
     """
 
     def __init__(
         self,
-        power_rail_path: Path | None = None,
+        power_rail_path: Path | _JetsonRail | None = None,
         sample_interval_s: float = 0.005,
     ) -> None:
-        self._rail_path = power_rail_path or _find_jetson_power_rail()
-        if self._rail_path is None:
+        if isinstance(power_rail_path, _JetsonRail):
+            self._rail = power_rail_path
+        elif isinstance(power_rail_path, Path):
+            self._rail = _JetsonRail(power_path=power_rail_path)
+        else:
+            self._rail = _find_jetson_power_rail()
+        if self._rail is None:
             raise RuntimeError(
                 "No Jetson power rail found in /sys/class/hwmon/. "
                 "Ensure the INA3221 driver is loaded."
@@ -184,14 +237,17 @@ class JetsonEnergyMonitor(EnergyMonitor):
 
     @property
     def rail_path(self) -> Path:
-        assert self._rail_path is not None
-        return self._rail_path
+        r = self._rail
+        assert r is not None
+        if r.power_path is not None:
+            return r.power_path
+        assert r.voltage_path is not None
+        return r.voltage_path
 
     def _read_power_w(self) -> float:
-        """Read instantaneous power in watts from sysfs (value is in µW)."""
-        assert self._rail_path is not None
-        raw = self._rail_path.read_text().strip()
-        return int(raw) / 1_000_000.0
+        """Read instantaneous power in watts from sysfs."""
+        assert self._rail is not None
+        return self._rail.read_power_w()
 
     def _sample_loop(self) -> None:
         while not self._stop_event.is_set():

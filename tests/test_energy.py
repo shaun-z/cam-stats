@@ -8,8 +8,10 @@ from xstream.benchmark.energy import (
     JetsonEnergyMonitor,
     NoOpEnergyMonitor,
     RaplEnergyMonitor,
+    _JetsonRail,
     _find_jetson_power_rail,
     _find_rapl_energy_file,
+    _is_jetson,
     _trapezoidal_energy,
     create_energy_monitor,
 )
@@ -56,19 +58,39 @@ def test_jetson_monitor_with_fake_sysfs(tmp_path: Path):
     assert mon.rail_path == rail_file
 
 
+def test_jetson_monitor_with_fake_vi_sysfs(tmp_path: Path):
+    """Simulate a Jetson sysfs voltage × current rail (no power*_input)."""
+    # 5V × 3A = 15W → voltage 5000 mV, current 3000 mA
+    voltage_file = tmp_path / "in1_input"
+    current_file = tmp_path / "curr1_input"
+    voltage_file.write_text("5000\n")
+    current_file.write_text("3000\n")
+
+    rail = _JetsonRail(voltage_path=voltage_file, current_path=current_file)
+    mon = JetsonEnergyMonitor(power_rail_path=rail, sample_interval_s=0.002)
+    mon.start()
+    time.sleep(0.05)
+    energy = mon.stop()
+
+    assert energy > 0.0
+
+
 def test_find_jetson_power_rail_none_on_non_jetson():
-    """On a non-Jetson machine, should return None."""
-    # This test runs on the dev server (not Jetson), so no INA3221 rails
-    # exist — _find_jetson_power_rail should return None gracefully.
+    """On a non-Jetson machine, should return None; on Jetson, a valid rail."""
     rail = _find_jetson_power_rail()
     # Can't assert None (might run on Jetson CI), but it shouldn't crash.
-    assert rail is None or rail.exists()
+    if rail is not None:
+        # Verify it can actually read a power value
+        assert rail.read_power_w() >= 0.0
 
 
 def test_create_energy_monitor_jetson_fallback():
-    """If Jetson sysfs is absent, jetson platform should fall back to NoOp."""
+    """If Jetson sysfs is absent, fall back to NoOp; on Jetson, use Jetson monitor."""
     mon = create_energy_monitor("cuda:0", platform="jetson")
-    assert isinstance(mon, NoOpEnergyMonitor)
+    if _is_jetson():
+        assert isinstance(mon, JetsonEnergyMonitor)
+    else:
+        assert isinstance(mon, NoOpEnergyMonitor)
 
 
 def test_create_energy_monitor_tpu():
@@ -121,9 +143,12 @@ def test_rapl_monitor_wrap_around(tmp_path: Path):
 
 
 def test_create_energy_monitor_cpu_auto():
-    """--device cpu with auto platform should try RAPL, fall back to NoOp."""
+    """--device cpu with auto platform: Jetson detected first, else RAPL/NoOp."""
     mon = create_energy_monitor("cpu", platform="auto")
-    assert isinstance(mon, (RaplEnergyMonitor, NoOpEnergyMonitor))
+    if _is_jetson():
+        assert isinstance(mon, JetsonEnergyMonitor)
+    else:
+        assert isinstance(mon, (RaplEnergyMonitor, NoOpEnergyMonitor))
 
 
 def test_create_energy_monitor_cpu_explicit_fallback():
